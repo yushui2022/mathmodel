@@ -1,0 +1,23 @@
+# LangChain相关依赖
+langchain-community>=0.0.20
+langchain-core>=0.1.0
+faiss-cpu>=1.7.4
+
+# 数据处理和分析
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# 可视化
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Word文档处理
+python-docx>=0.21.0
+
+# 机器学习（可选，用于某些高级功能）
+scikit-learn>=1.3.0
+
+# 其他工具
+python-dotenv>=1.0.0
+
