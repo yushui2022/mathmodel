@@ -1,9 +1,10 @@
 import os
 import time
+import math
+import re
+import asyncio
+from datetime import datetime
 from operator import itemgetter
-from langchain_community.chat_models import ChatOllama
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -11,223 +12,136 @@ import docx
 from docx.shared import Inches
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
-# 导入自定义模块
+# 模型与向量库配置集中在 config.py
+from config import embeddings, rerank_embeddings, llm, retriever, vectorstore
+
+# 业务模块
 from data_analysis import DataGenerator, StatisticalAnalyzer, DataProcessor
 from visualization import ChartGenerator
 from math_utils import OptimizationSolver, StatisticalModel, NumericalMethods, ModelEvaluator
-
-# ===================== 1. 初始化本地组件（基础配置） =====================
-# 初始化Ollama嵌入模型（本地运行）
-embeddings = OllamaEmbeddings(
-    model="bge-m3:latest",  # 本地嵌入模型（需先ollama pull bge-m3:latest）
-    base_url="http://localhost:11434"
+from web_data import WebDataCache, TavilyClient, fetch_authoritative_tables_with_cache
+from tavily_processing import process_tavily_payload
+from iterative_generation import expand_until_length, LengthSpec
+from prompts import (
+    GLOBAL_AGENT_PROMPT,
+    ABSTRACT_PROMPT_TEMPLATE,
+    PROBLEM_RESTATEMENT_PROMPT,
+    PROBLEM_ANALYSIS_PROMPT,
+    MODEL_ASSUMPTION_PROMPT,
+    SYMBOL_EXPLANATION_PROMPT,
+    MODEL_BUILDING_PROMPT,
+    MODEL_SOLVING_PROMPT,
+    RESULTS_ANALYSIS_PROMPT,
 )
 
-# 初始化Ollama对话模型（本地运行，建议用llama3/mistral等大模型保证生成质量）
-llm = ChatOllama(
-    model="mistral:7b-instruct-v0.3-q4_K_M",  # 需先ollama pull llama3:8b-instruct-q4_K_M
-    base_url="http://localhost:11434",
-    temperature=0.1,  # 低随机性保证格式严格
-    num_ctx=4096,  # 增大上下文窗口，容纳长提示词
-    # 限制单次输出长度，避免某些情况下“越写越多”导致等待很久
-    num_predict=1024,
-)
+# ===================== 全局检索缓存 =====================
+# 全局缓存字典，避免重复检索相同查询
+_retrieval_cache = {}
+_retrieval_lock = asyncio.Lock()
 
-# 加载本地FAISS向量库（数学建模知识库，需提前构建）
-# 注意：替换为你自己的FAISS索引文件夹路径
-vectorstore = FAISS.load_local(
-    "math_modeling_faiss_index",  # 你的数学建模知识库向量库路径
-    embeddings,
-    allow_dangerous_deserialization=True  # 本地运行需开启
-)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 5})  # 检索5条相关知识库内容
 
-# ===================== 2. 嵌入你的所有提示词（核心部分） =====================
-# 2.1 全局Agent前置提示（核心身份定义）
-GLOBAL_AGENT_PROMPT = """你作为数学建模比赛专家，在接收用户提供的赛题后，需自主决策并生成论文模板，请紧密围绕知识库评估适配性最优的模型，全力生成文档，过程中禁止反问，无需询问论文标题，直接自主拟定，标题要贴合所选模型！
-严格遵循指定的字数、段落规范，严谨完成内容撰写，确保生成的内容结构清晰、可读性强，暂无法确定的内容留空并添加【需补充】标记提示读者。"""
+def _keyword_score(query: str, text: str) -> float:
+    """非常轻量的关键词匹配打分（统计关键词出现次数）。"""
+    if not query or not text:
+        return 0.0
+    # 按中英文常见分隔符切词（简易版）
+    tokens = [t.strip() for t in re.split(r"[ ,，。；;、\n\t]", query) if t.strip()]
+    if not tokens:
+        return 0.0
+    score = 0
+    for tok in tokens:
+        score += text.count(tok)
+    return float(score)
 
-# 2.2 摘要生成提示词（完整嵌入你的格式要求）
-ABSTRACT_PROMPT_TEMPLATE = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文摘要必须严格按照以下格式生成，字数总计800字左右：
-### 摘要模板
-**第一段100字：**
-本文通过建立和分析数学模型，解决了[具体问题]，对[相关领域或实际应用]具有重要的理论和实践意义。
 
-**第二段50字：**
-在模型建立方面，针对问题一，我们构建了一个基于[模型或评价体系名称]的模型；针对问题二，我们发展了一个基于[模型或评价体系名称]的模型；对于问题三，我们提出了一个基于[模型或评价体系名称]的模型。
+def _hybrid_retrieve(query: str, k: int = 5, initial_k: int = 12):
+    """
+    混合检索：
+    1）先用 FAISS 做向量召回 initial_k 条；
+    2）用关键词匹配 + 轻量 bge-reranker-v2-m3 做二次重排序；
+    3）返回前 k 条。
+    """
+    # 1. 向量召回（带相似度分数）
+    results = vectorstore.similarity_search_with_score(query, k=initial_k)
+    if not results:
+        return []
 
-**第三段150字：**
-针对问题一，我们建立了[具体模型名称]，运用[使用的软件名称]，采用了[使用的算法或方法]，计算了[需要计算的变量或参数]，进行了[预测/评价/分析等]，以[具体目的或效果]。
+    docs, dist_scores = zip(*results)
 
-**第四段150字：**
-针对问题二，我们构建了[具体模型名称]，利用[使用的软件名称]，实施了[使用的算法或方法]，分析了[需要分析的数据或现象]，完成了[预测/评价/分析等]，旨在[具体目的或效果]。
+    # 将距离转换为相似度（距离越小，相似度越大）
+    vec_sims = [1.0 / (1.0 + float(d)) for d in dist_scores]
 
-**第五段150字：**
-针对问题三，我们发展了[具体模型名称]，通过[使用的软件名称]，应用了[使用的算法或方法]，评估了[需要评估的指标或影响]，实现了[预测/评价/分析等]，以期达到[具体目的或效果]。
+    # 2. 关键词得分
+    kw_scores = [_keyword_score(query, d.page_content or "") for d in docs]
+    if max(kw_scores) > 0:
+        kw_scores = [s / max(kw_scores) for s in kw_scores]
+    else:
+        kw_scores = [0.0 for _ in kw_scores]
 
-**第六段100字：**
-通过这些模型的建立和验证，我们得到了[具体结果或发现]。在分析模型的优缺点后，我们提出了[改进措施或建议]，以期提高模型的[准确性/实用性/效率]。
-请严格按照上述分段和字数要求生成摘要，自主拟定论文标题，标题要贴合所选模型！"""),
-    ("human", """请根据以下数学建模赛题相关信息生成摘要：
-赛题相关信息：{user_prompt}
-知识库参考内容：{context}
-要求：摘要总字数800字左右，严格按指定分段格式生成，标题自主拟定且贴合模型！""")
-])
+    # 3. 轻量重排序：bge-reranker-v2-m3 做打分
+    texts = [d.page_content or "" for d in docs]
+    q_emb = rerank_embeddings.embed_query(query)
+    doc_embs = rerank_embeddings.embed_documents(texts)
 
-# 2.3 问题重述生成提示词（嵌入你的格式要求）
-PROBLEM_RESTATEMENT_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文问题重述必须严格按照以下格式生成：
-**第一段300字: 1.1 问题背景:** 写出该问题出现的问题背景,可以从社会,时代,问题现实,问题原因等角度写,字数200-400字。
-**第二段: 1.2 问题提出:** 重述赛题问题,可润色但严禁改变题意。
-请基于已生成的摘要内容，严格按此格式生成问题重述！"""),
-    ("human", """请根据以下摘要内容生成问题重述：
-摘要内容：{abstract_content}
-赛题相关信息：{user_prompt}
-知识库参考内容：{context}
-要求：严格按指定分段和字数要求生成！""")
-])
+    rerank_sims = []
+    for emb in doc_embs:
+        # 余弦相似度
+        dot = sum(a * b for a, b in zip(q_emb, emb))
+        q_norm = math.sqrt(sum(a * a for a in q_emb)) or 1.0
+        d_norm = math.sqrt(sum(a * a for a in emb)) or 1.0
+        rerank_sims.append(dot / (q_norm * d_norm))
 
-# 2.4 问题分析生成提示词（嵌入你的格式要求）
-PROBLEM_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文问题分析必须严格按照以下格式生成，要求：中肯、确切；术语专业、内行；原理依据正确、明确；表述简明，关键步骤列出；忌外行话、术语不明确、表述混乱冗长。
-### 问题分析格式
-**第一段(500字): 2.1 问题一分析:** 什么什么主要包括几个方面,根据什么什么小类的影响因素决定,建立怎样的模型或体系,提取了什么什么类的指标对数据进行特征训练(如果该问题运用到了学习算法请写出,如果没有使用,请不要写)。
-**第二段(500字): 2.2 问题二分析:** 与第一段模板相似。
-**第三段(500字): 2.3 问题三分析:** 与第一段模板相似。
-请基于已生成的摘要和问题重述，严格按此格式生成问题分析！"""),
-    ("human", """请根据以下内容生成问题分析：
-摘要内容：{abstract_content}
-问题重述内容：{problem_restatement_content}
-赛题相关信息：{user_prompt}
-知识库参考内容：{context}
-要求：严格按指定分段和字数要求生成，术语专业、表述简明！""")
-])
+    # 归一化到 0-1
+    min_r, max_r = min(rerank_sims), max(rerank_sims)
+    if max_r > min_r:
+        rerank_sims = [(s - min_r) / (max_r - min_r) for s in rerank_sims]
+    else:
+        rerank_sims = [0.5 for _ in rerank_sims]
 
-# 2.5 模型假设生成提示词（嵌入你的格式要求）
-MODEL_ASSUMPTION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文模型假设必须严格按照以下要求生成：
-1. 共6条假设，每条不超过100字；
-2. 假设需基于赛题条件和前文（摘要、问题分析）作出，如：假设XX与XX无关系、XX在XX情况下概率相同、XX仅受XX影响等；
-3. 假设要贴合实际，符合数学建模逻辑。
-请严格按此要求生成模型假设！"""),
-    ("human", """请根据以下内容生成6条模型假设：
-摘要内容：{abstract_content}
-问题分析内容：{problem_analysis_content}
-赛题相关信息：{user_prompt}
-知识库参考内容：{context}
-要求：每条假设≤100字，共6条，贴合赛题和前文内容！""")
-])
+    # 4. 融合三种得分：向量相似 + 关键词 + reranker
+    final_scores = []
+    for v, k_s, r in zip(vec_sims, kw_scores, rerank_sims):
+        # 权重可以按需调整：reranker 为主，向量 + 关键词 辅助
+        score = 0.6 * r + 0.3 * v + 0.1 * k_s
+        final_scores.append(score)
 
-# 2.6 符号说明生成提示词（嵌入你的格式要求）
-SYMBOL_EXPLANATION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文符号说明必须严格按照以下格式生成：
-    格式要求："汉字"---"符号"，例如：收益---P；
-    需包含赛题中的核心词语、建模中使用的矩阵/因素等符号定义；
-    符号定义要专业、统一，符合数学建模规范。
-    请基于已生成的摘要、问题分析，严格按此格式生成符号说明！"""),
-    ("human", """请根据以下内容生成符号说明：
-    摘要内容：{abstract_content}
-    问题分析内容：{problem_analysis_content}
-    赛题相关信息：{user_prompt}
-    知识库参考内容：{context}
-    要求：严格按"汉字---符号"格式生成，覆盖核心概念和建模变量！""")
-])
+    ranked = sorted(zip(docs, final_scores), key=lambda x: x[1], reverse=True)
+    top_docs = [d for d, _ in ranked[:k]]
+    return top_docs
 
-# 2.7 模型建立生成提示词（新增）
-MODEL_BUILDING_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文模型建立章节必须严格按照以下格式生成，字数总计2000字左右：
-    ### 模型建立格式
-    **第一段(600字): 3.1 问题一模型建立:** 
-    详细描述针对问题一建立的数学模型，包括：
-    1. 模型类型和理论基础（如线性回归、时间序列、优化模型等）；
-    2. 模型数学表达式和参数说明；
-    3. 模型建立的具体步骤和方法；
-    4. 使用的算法和求解思路。
-    
-    **第二段(600字): 3.2 问题二模型建立:** 
-    与第一段格式相似，详细描述问题二的模型建立过程。
-    
-    **第三段(600字): 3.3 问题三模型建立:** 
-    与第一段格式相似，详细描述问题三的模型建立过程。
-    
-    **第四段(200字): 3.4 模型关联性分析:** 
-    说明三个模型之间的关联关系，如何协同解决问题。
-    
-    要求：模型描述要专业、数学表达式要准确、逻辑清晰！"""),
-    ("human", """请根据以下内容生成模型建立章节：
-    摘要内容：{abstract_content}
-    问题分析内容：{problem_analysis_content}
-    模型假设内容：{model_assumption_content}
-    符号说明内容：{symbol_explanation_content}
-    赛题相关信息：{user_prompt}
-    知识库参考内容：{context}
-    数据分析结果：{data_analysis_results}
-    要求：严格按指定分段和字数要求生成，包含数学表达式！""")
-])
 
-# 2.8 模型求解生成提示词（新增）
-MODEL_SOLVING_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文模型求解章节必须严格按照以下格式生成，字数总计1500字左右：
-    ### 模型求解格式
-    **第一段(500字): 4.1 问题一模型求解:** 
-    详细描述问题一模型的求解过程，包括：
-    1. 使用的求解算法（如梯度下降、线性规划、数值积分等）；
-    2. 求解步骤和关键计算过程；
-    3. 使用的软件工具（如Python、MATLAB、Excel等）；
-    4. 求解结果和关键数值。
-    
-    **第二段(500字): 4.2 问题二模型求解:** 
-    与第一段格式相似，描述问题二的求解过程。
-    
-    **第三段(500字): 4.3 问题三模型求解:** 
-    与第一段格式相似，描述问题三的求解过程。
-    
-    要求：求解过程要详细、结果要准确、可重现！"""),
-    ("human", """请根据以下内容生成模型求解章节：
-    模型建立内容：{model_building_content}
-    赛题相关信息：{user_prompt}
-    知识库参考内容：{context}
-    求解结果数据：{solving_results}
-    要求：严格按指定分段和字数要求生成，包含具体求解步骤和结果！""")
-])
+def get_cached_retrieval(query: str):
+    """
+    带缓存的检索函数
+    :param query: 检索查询字符串
+    :return: 格式化的检索上下文
+    """
+    if query not in _retrieval_cache:
+        docs = _hybrid_retrieve(query, k=5, initial_k=12)
+        context = format_docs(docs)
+        _retrieval_cache[query] = (docs, context)
+        return docs, context
+    return _retrieval_cache[query]
 
-# 2.9 结果分析生成提示词（新增）
-RESULTS_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", GLOBAL_AGENT_PROMPT),
-    ("system", """数学建模论文结果分析章节必须严格按照以下格式生成，字数总计1500字左右：
-    ### 结果分析格式
-    **第一段(500字): 5.1 问题一结果分析:** 
-    详细分析问题一的求解结果，包括：
-    1. 结果的可视化展示（图表说明）；
-    2. 结果的合理性和有效性分析；
-    3. 关键发现和洞察；
-    4. 结果的敏感性分析或误差分析。
-    
-    **第二段(500字): 5.2 问题二结果分析:** 
-    与第一段格式相似，分析问题二的结果。
-    
-    **第三段(500字): 5.3 问题三结果分析:** 
-    与第一段格式相似，分析问题三的结果。
-    
-    要求：分析要深入、图表要引用、结论要明确！"""),
-    ("human", """请根据以下内容生成结果分析章节：
-    模型求解内容：{model_solving_content}
-    赛题相关信息：{user_prompt}
-    知识库参考内容：{context}
-    图表文件列表：{chart_files}
-    统计分析结果：{statistical_results}
-    要求：严格按指定分段和字数要求生成，引用生成的图表，进行深入分析！""")
-])
 
+async def get_cached_retrieval_async(query: str):
+    """
+    异步版缓存检索：使用锁避免并发重复检索同一 query。
+    注意：FAISS 检索是同步的，这里用 asyncio.to_thread 放到线程池执行。
+    """
+    async with _retrieval_lock:
+        if query in _retrieval_cache:
+            return _retrieval_cache[query]
+
+    # 不在锁内执行耗时操作，避免阻塞其他 key 的读取
+    docs = await asyncio.to_thread(_hybrid_retrieve, query, 5, 12)
+    context = format_docs(docs)
+
+    async with _retrieval_lock:
+        _retrieval_cache[query] = (docs, context)
+        return _retrieval_cache[query]
 
 # ===================== 3. 核心生成函数（LCEL链式调用） =====================
 def format_docs(docs):
@@ -249,6 +163,44 @@ def format_docs(docs):
     return "\n\n".join(parts)
 
 
+# 全局变量，用于存储进度回调函数
+_global_progress_callback = None
+
+# 最近一次 Tavily 爬取结果（供 API/前端读取）
+_last_tavily_payload = None
+_last_tavily_run_dir = None
+
+
+def get_last_tavily_payload():
+    return _last_tavily_payload
+
+
+def get_last_tavily_run_dir():
+    return _last_tavily_run_dir
+
+
+def _load_tavily_constraints() -> str:
+    path = os.path.join(os.path.dirname(__file__), "tavily_query_constraints.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _new_tavily_run_dir() -> str:
+    base = os.path.join(os.path.dirname(__file__), "tavily_runs")
+    os.makedirs(base, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(base, ts)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+def set_progress_callback(callback):
+    """设置全局进度回调函数"""
+    global _global_progress_callback
+    _global_progress_callback = callback
+
 def _timed(label: str):
     """简单计时器：打印每一步耗时，方便定位卡顿点。"""
     start = time.time()
@@ -256,7 +208,11 @@ def _timed(label: str):
     def done(extra: str = ""):
         cost = time.time() - start
         tail = f" {extra}" if extra else ""
-        print(f"    - {label} 耗时：{cost:.1f}s{tail}")
+        message = f"{label} 耗时：{cost:.1f}s{tail}"
+        tqdm.write(f"    - {message}")
+        # 通过全局回调函数传递耗时信息
+        if _global_progress_callback:
+            _global_progress_callback(None, message)
 
     return done
 
@@ -268,10 +224,9 @@ def generate_section(chain, input_data):
 
 # 3.1 生成摘要
 def generate_abstract(user_prompt):
-    # 检索知识库相关内容
+    # 检索知识库相关内容（使用缓存）
     t = _timed("摘要-检索")
-    docs = retriever.invoke(user_prompt)
-    context = format_docs(docs)
+    docs, context = get_cached_retrieval(user_prompt)
     t(f"(命中{len(docs)}条)")
     # 构建LCEL链（检索上下文 + 用户提示词 → 摘要生成）
     abstract_chain = (
@@ -292,8 +247,7 @@ def generate_abstract(user_prompt):
 # 3.2 生成问题重述
 def generate_problem_restatement(user_prompt, abstract_content):
     t = _timed("问题重述-检索")
-    docs = retriever.invoke(user_prompt + "问题重述")
-    context = format_docs(docs)
+    docs, context = get_cached_retrieval(user_prompt + "问题重述")
     t(f"(命中{len(docs)}条)")
     restatement_chain = (
             RunnablePassthrough.assign(
@@ -317,8 +271,7 @@ def generate_problem_restatement(user_prompt, abstract_content):
 # 3.3 生成问题分析
 def generate_problem_analysis(user_prompt, abstract_content, problem_restatement_content):
     t = _timed("问题分析-检索")
-    docs = retriever.invoke(user_prompt + "问题分析")
-    context = format_docs(docs)
+    docs, context = get_cached_retrieval(user_prompt + "问题分析")
     t(f"(命中{len(docs)}条)")
     analysis_chain = (
             RunnablePassthrough.assign(
@@ -344,8 +297,7 @@ def generate_problem_analysis(user_prompt, abstract_content, problem_restatement
 # 3.4 生成模型假设
 def generate_model_assumption(user_prompt, abstract_content, problem_analysis_content):
     t = _timed("模型假设-检索")
-    docs = retriever.invoke(user_prompt + "模型假设")
-    context = format_docs(docs)
+    docs, context = get_cached_retrieval(user_prompt + "模型假设")
     t(f"(命中{len(docs)}条)")
     assumption_chain = (
             RunnablePassthrough.assign(
@@ -371,8 +323,7 @@ def generate_model_assumption(user_prompt, abstract_content, problem_analysis_co
 # 3.5 生成符号说明
 def generate_symbol_explanation(user_prompt, abstract_content, problem_analysis_content):
     t = _timed("符号说明-检索")
-    docs = retriever.invoke(user_prompt + "符号说明")
-    context = format_docs(docs)
+    docs, context = get_cached_retrieval(user_prompt + "符号说明")
     t(f"(命中{len(docs)}条)")
     symbol_chain = (
             RunnablePassthrough.assign(
@@ -397,9 +348,9 @@ def generate_symbol_explanation(user_prompt, abstract_content, problem_analysis_
 
 # 3.6 生成模型建立（新增）
 def generate_model_building(user_prompt, abstract_content, problem_analysis_content,
-                           model_assumption_content, symbol_explanation_content, data_analysis_results):
-    docs = retriever.invoke(user_prompt + "模型建立")
-    context = format_docs(docs)
+                           model_assumption_content, symbol_explanation_content, data_analysis_results,
+                           conversation_context: str = ""):
+    docs, context = get_cached_retrieval(user_prompt + "模型建立")
     building_chain = (
             RunnablePassthrough.assign(
                 context=lambda x: context,
@@ -414,7 +365,7 @@ def generate_model_building(user_prompt, abstract_content, problem_analysis_cont
             | llm
             | StrOutputParser()
     )
-    return generate_section(building_chain, {
+    draft = generate_section(building_chain, {
         "user_prompt": user_prompt,
         "abstract_content": abstract_content,
         "problem_analysis_content": problem_analysis_content,
@@ -422,12 +373,21 @@ def generate_model_building(user_prompt, abstract_content, problem_analysis_cont
         "symbol_explanation_content": symbol_explanation_content,
         "data_analysis_results": data_analysis_results
     })
+    # 多轮扩写：字符数目标近似对应 prompts 中的“字数”
+    return expand_until_length(
+        llm=llm,
+        draft=draft,
+        length_spec=LengthSpec(target=2000, tolerance_ratio=0.10),
+        requirements="模型建立：严格按3.1/3.2/3.3/3.4分段；公式LaTeX+编号；步骤可复现；符号不冲突；禁用模糊措辞。",
+        context_blob=f"【赛题】{user_prompt}\n\n【多轮对话补充】{conversation_context}\n\n【知识库】{context}\n\n【摘要】{abstract_content}\n\n【问题分析】{problem_analysis_content}\n\n【模型假设】{model_assumption_content}\n\n【符号说明】{symbol_explanation_content}\n\n【数据分析结论/外部表格】{data_analysis_results}",
+        max_rounds=4,
+        progress_cb=lambda msg: (_global_progress_callback(None, msg) if _global_progress_callback else None),
+    )
 
 
 # 3.7 生成模型求解（新增）
-def generate_model_solving(user_prompt, model_building_content, solving_results):
-    docs = retriever.invoke(user_prompt + "模型求解")
-    context = format_docs(docs)
+def generate_model_solving(user_prompt, model_building_content, solving_results, conversation_context: str = ""):
+    docs, context = get_cached_retrieval(user_prompt + "模型求解")
     solving_chain = (
             RunnablePassthrough.assign(
                 context=lambda x: context,
@@ -439,17 +399,25 @@ def generate_model_solving(user_prompt, model_building_content, solving_results)
             | llm
             | StrOutputParser()
     )
-    return generate_section(solving_chain, {
+    draft = generate_section(solving_chain, {
         "user_prompt": user_prompt,
         "model_building_content": model_building_content,
         "solving_results": solving_results
     })
+    return expand_until_length(
+        llm=llm,
+        draft=draft,
+        length_spec=LengthSpec(target=5000, tolerance_ratio=0.10),
+        requirements="模型求解：4.1/4.2/4.3分段；算法步骤可复现；参数具体到数值；结果含单位与关键数值；工具/库/函数明确。",
+        context_blob=f"【赛题】{user_prompt}\n\n【多轮对话补充】{conversation_context}\n\n【知识库】{context}\n\n【模型建立】{model_building_content}\n\n【求解结果提示】{solving_results}",
+        max_rounds=4,
+        progress_cb=lambda msg: (_global_progress_callback(None, msg) if _global_progress_callback else None),
+    )
 
 
 # 3.8 生成结果分析（新增）
-def generate_results_analysis(user_prompt, model_solving_content, chart_files, statistical_results):
-    docs = retriever.invoke(user_prompt + "结果分析")
-    context = format_docs(docs)
+def generate_results_analysis(user_prompt, model_solving_content, chart_files, statistical_results, conversation_context: str = ""):
+    docs, context = get_cached_retrieval(user_prompt + "结果分析")
     analysis_chain = (
             RunnablePassthrough.assign(
                 context=lambda x: context,
@@ -462,12 +430,72 @@ def generate_results_analysis(user_prompt, model_solving_content, chart_files, s
             | llm
             | StrOutputParser()
     )
-    return generate_section(analysis_chain, {
+    draft = generate_section(analysis_chain, {
         "user_prompt": user_prompt,
         "model_solving_content": model_solving_content,
         "chart_files": chart_files,
         "statistical_results": statistical_results
     })
+    return expand_until_length(
+        llm=llm,
+        draft=draft,
+        length_spec=LengthSpec(target=4500, tolerance_ratio=0.10),
+        requirements="结果分析：5.1/5.2/5.3分段；必须结合图表清单逐条引用并解读；包含敏感性/误差分析且给具体数值；结合赛题现实意义。",
+        context_blob=f"【赛题】{user_prompt}\n\n【多轮对话补充】{conversation_context}\n\n【知识库】{context}\n\n【模型求解】{model_solving_content}\n\n【图表清单】{chart_files}\n\n【统计分析结果】{statistical_results}",
+        max_rounds=4,
+        progress_cb=lambda msg: (_global_progress_callback(None, msg) if _global_progress_callback else None),
+    )
+
+
+# ===================== 异步生成（用于并行非依赖章节） =====================
+async def generate_model_assumption_async(user_prompt, abstract_content, problem_analysis_content):
+    t = _timed("模型假设-检索(异步)")
+    docs, context = await get_cached_retrieval_async(user_prompt + "模型假设")
+    t(f"(命中{len(docs)}条)")
+    assumption_chain = (
+            RunnablePassthrough.assign(
+                context=lambda x: context,
+                user_prompt=lambda x: x["user_prompt"],
+                abstract_content=lambda x: x["abstract_content"],
+                problem_analysis_content=lambda x: x["problem_analysis_content"]
+            )
+            | MODEL_ASSUMPTION_PROMPT
+            | llm
+            | StrOutputParser()
+    )
+    t2 = _timed("模型假设-生成(异步)")
+    out = await asyncio.to_thread(generate_section, assumption_chain, {
+        "user_prompt": user_prompt,
+        "abstract_content": abstract_content,
+        "problem_analysis_content": problem_analysis_content
+    })
+    t2(f"(输出{len(out)}字)")
+    return out
+
+
+async def generate_symbol_explanation_async(user_prompt, abstract_content, problem_analysis_content):
+    t = _timed("符号说明-检索(异步)")
+    docs, context = await get_cached_retrieval_async(user_prompt + "符号说明")
+    t(f"(命中{len(docs)}条)")
+    symbol_chain = (
+            RunnablePassthrough.assign(
+                context=lambda x: context,
+                user_prompt=lambda x: x["user_prompt"],
+                abstract_content=lambda x: x["abstract_content"],
+                problem_analysis_content=lambda x: x["problem_analysis_content"]
+            )
+            | SYMBOL_EXPLANATION_PROMPT
+            | llm
+            | StrOutputParser()
+    )
+    t2 = _timed("符号说明-生成(异步)")
+    out = await asyncio.to_thread(generate_section, symbol_chain, {
+        "user_prompt": user_prompt,
+        "abstract_content": abstract_content,
+        "problem_analysis_content": problem_analysis_content
+    })
+    t2(f"(输出{len(out)}字)")
+    return out
 
 
 # 3.9 数据分析和可视化生成函数（新增）
@@ -478,7 +506,7 @@ def generate_data_and_charts(user_prompt, problem_type="general"):
     :param problem_type: 问题类型 ('time_series', 'optimization', 'regression', 'general')
     :return: (数据字典, 图表文件列表, 统计分析结果)
     """
-    print("  生成示例数据和图表...")
+    tqdm.write("  生成示例数据和图表...")
     chart_generator = ChartGenerator()
     data_generator = DataGenerator()
     analyzer = StatisticalAnalyzer()
@@ -556,68 +584,178 @@ def generate_data_and_charts(user_prompt, problem_type="general"):
 
 
 # ===================== 4. 整合生成Word文档 =====================
-def generate_math_modeling_paper(user_prompt, save_path="数学建模论文.docx", 
-                                generate_charts=True, generate_data=True):
+def generate_math_modeling_paper(user_prompt, save_path="数学建模论文.docx",
+                                generate_charts=True, generate_data=True,
+                                progress_callback=None,
+                                conversation_context: str = ""):
     """
     生成完整的数学建模论文Word文档（增强版，包含数据分析和图表）
     :param user_prompt: 用户提供的赛题描述（几百字的长提示词）
     :param save_path: 论文保存路径
     :param generate_charts: 是否生成图表
     :param generate_data: 是否生成示例数据
+    :param progress_callback: 进度回调函数，接收(progress, message)参数
     """
-    print("=== 开始生成数学建模论文（增强版） ===")
+    def update_progress(progress, message):
+        """更新进度"""
+        if progress_callback:
+            progress_callback(progress, message)
+    
+    # 设置全局进度回调函数，以便 _timed 函数能够传递耗时信息
+    set_progress_callback(progress_callback)
+    
+    tqdm.write("=== 开始生成数学建模论文（增强版） ===")
+    
+    # 定义所有步骤
+    steps = [
+        ("生成示例数据和图表", generate_data or generate_charts),
+        ("联网抓取权威数据表格（可选）", True),
+        ("生成摘要", True),
+        ("生成问题重述", True),
+        ("生成问题分析", True),
+        ("生成模型假设", True),
+        ("生成符号说明", True),
+        ("生成模型建立", True),
+        ("生成模型求解", True),
+        ("生成结果分析", True),
+        ("整合Word文档", True),
+    ]
+    
+    # 创建总进度条
+    total_steps = sum(1 for _, enabled in steps if enabled)
+    pbar = tqdm(total=total_steps, desc="论文生成进度", unit="步骤", 
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
     
     # 步骤0：生成示例数据和图表（如果需要）
     generated_data = {}
     chart_files = []
     statistical_results = ""
     data_analysis_results = ""
+    web_data_summary = ""
+    web_data_citations = ""
+    tavily_analysis_text = ""
+    tavily_charts = []
+    tavily_raw_csvs = []
+    tavily_cleaned_csvs = []
     
     if generate_data or generate_charts:
+        update_progress(10, "正在生成示例数据和图表...（步骤1/11）")
+        pbar.set_description("生成示例数据和图表")
         generated_data, chart_files, statistical_results = generate_data_and_charts(user_prompt)
         data_analysis_results = f"已生成{len(generated_data)}组示例数据，{len(chart_files)}个图表"
+        pbar.update(1)
+
+    # 步骤0.5：联网抓取权威表格（可选：有 TAVILY_API_KEY 才会启用）
+    update_progress(20, "正在联网抓取权威数据表格...（步骤2/11）")
+    pbar.set_description("联网抓取权威数据表格（可选）")
+    try:
+        tavily = TavilyClient()
+        if tavily.enabled():
+            cache = WebDataCache()
+            # 针对建模题常见的“数据来源”检索模板：你也可以按赛题再细化关键词
+            query = f"{user_prompt} 权威 数据 表格 统计 年鉴 官方"
+            # 为本次运行创建 tavily_runs 子目录（按时间戳分批次）
+            tavily_base_dir = os.path.join(os.path.dirname(__file__), "tavily_runs")
+            os.makedirs(tavily_base_dir, exist_ok=True)
+            latest_dir = _new_tavily_run_dir()
+
+            payload = fetch_authoritative_tables_with_cache(
+                query, cache, tavily, max_sources=3, max_tables_per_source=2, run_dir=latest_dir
+            )
+            web_data_summary = payload.get("summary", "")
+            # 生成引用列表（最多 3 条）
+            sources = payload.get("sources", [])[:3]
+            web_data_citations = "\n".join([f"- {s.get('title','')}：{s.get('url','')}" for s in sources])
+
+            # 对 tavily 表格做通用清洗 + 分析 + 可视化
+            try:
+                tavily_analysis_text, tavily_charts, tavily_cleaned_csvs, tavily_raw_csvs = process_tavily_payload(
+                    payload, os.path.join(latest_dir, "processed")
+                )
+                # 记录供 API/前端读取
+                global _last_tavily_payload, _last_tavily_run_dir
+                _last_tavily_payload = payload
+                _last_tavily_run_dir = latest_dir
+            except Exception as e:
+                tavily_analysis_text = f"外部权威表格自动分析失败：{e}"
+                tavily_charts = []
+                tavily_raw_csvs = []
+                tavily_cleaned_csvs = []
+        else:
+            web_data_summary = "未启用联网数据抓取（未检测到环境变量 TAVILY_API_KEY）。"
+            web_data_citations = ""
+    except Exception as e:
+        web_data_summary = f"联网数据抓取失败：{e}"
+        web_data_citations = ""
+    pbar.update(1)
+
+    # 将 Tavily 的结构化分析文本并入数据分析结论，供后续“模型建立/结果分析”引用扩写
+    if tavily_analysis_text:
+        data_analysis_results = (data_analysis_results + "\n\n【外部权威表格结构化分析】\n" + tavily_analysis_text).strip()
     
     # 步骤1：生成摘要
-    print("1/8 生成摘要...")
-    abstract = generate_abstract(user_prompt)
+    update_progress(30, "正在生成摘要...（步骤3/11）")
+    pbar.set_description("生成摘要")
+    abstract = generate_abstract(user_prompt + ("\n\n【外部权威数据摘要】\n" + web_data_summary if web_data_summary else ""))
+    pbar.update(1)
 
     # 步骤2：生成问题重述
-    print("2/8 生成问题重述...")
+    update_progress(40, "正在生成问题重述...（步骤4/11）")
+    pbar.set_description("生成问题重述")
     problem_restatement = generate_problem_restatement(user_prompt, abstract)
+    pbar.update(1)
 
     # 步骤3：生成问题分析
-    print("3/8 生成问题分析...")
+    update_progress(50, "正在生成问题分析...（步骤5/11）")
+    pbar.set_description("生成问题分析")
     problem_analysis = generate_problem_analysis(user_prompt, abstract, problem_restatement)
+    pbar.update(1)
 
-    # 步骤4：生成模型假设
-    print("4/8 生成模型假设...")
-    model_assumption = generate_model_assumption(user_prompt, abstract, problem_analysis)
+    # 步骤4/5：并行生成（非依赖型章节）
+    # - 模型假设、符号说明只依赖摘要/问题分析，因此可并行以减少整体耗时
+    update_progress(60, "正在并行生成模型假设和符号说明...（步骤6-7/11）")
+    pbar.set_description("并行生成：模型假设 & 符号说明")
 
-    # 步骤5：生成符号说明
-    print("5/8 生成符号说明...")
-    symbol_explanation = generate_symbol_explanation(user_prompt, abstract, problem_analysis)
+    async def _run_parallel():
+        return await asyncio.gather(
+            generate_model_assumption_async(user_prompt, abstract, problem_analysis),
+            generate_symbol_explanation_async(user_prompt, abstract, problem_analysis),
+        )
+
+    model_assumption, symbol_explanation = asyncio.run(_run_parallel())
+    # 两个步骤都完成，进度条更新两次
+    pbar.update(2)
 
     # 步骤6：生成模型建立（新增）
-    print("6/8 生成模型建立...")
+    update_progress(70, "正在生成模型建立...（步骤8/11）")
+    pbar.set_description("生成模型建立")
     model_building = generate_model_building(
         user_prompt, abstract, problem_analysis, 
-        model_assumption, symbol_explanation, data_analysis_results
+        model_assumption, symbol_explanation,
+        data_analysis_results + ("\n\n【外部权威数据摘要】\n" + web_data_summary if web_data_summary else "") + ("\n\n【参考链接】\n" + web_data_citations if web_data_citations else ""),
+        conversation_context=conversation_context
     )
+    pbar.update(1)
     
     # 步骤7：生成模型求解（新增）
-    print("7/8 生成模型求解...")
+    update_progress(80, "正在生成模型求解...（步骤9/11）")
+    pbar.set_description("生成模型求解")
     solving_results = f"使用Python和NumPy/SciPy进行数值计算，已生成{len(chart_files)}个可视化结果"
-    model_solving = generate_model_solving(user_prompt, model_building, solving_results)
+    model_solving = generate_model_solving(user_prompt, model_building, solving_results, conversation_context=conversation_context)
+    pbar.update(1)
     
     # 步骤8：生成结果分析（新增）
-    print("8/8 生成结果分析...")
+    update_progress(90, "正在生成结果分析...（步骤10/11）")
+    pbar.set_description("生成结果分析")
     chart_files_str = "\n".join([f"{name}" for name, _ in chart_files])
     results_analysis = generate_results_analysis(
-        user_prompt, model_solving, chart_files_str, statistical_results
+        user_prompt, model_solving, chart_files_str, statistical_results, conversation_context=conversation_context
     )
+    pbar.update(1)
 
     # 步骤9：整合到Word文档
-    print("整合内容到Word文档...")
+    update_progress(95, "正在整合Word文档...（步骤11/11）")
+    pbar.set_description("整合Word文档")
     doc = docx.Document()
 
     # 添加标题（从摘要中提取，或自主生成）
@@ -657,6 +795,10 @@ def generate_math_modeling_paper(user_prompt, save_path="数学建模论文.docx
     doc.add_paragraph(results_analysis)
     
     # 插入图表（新增）
+    # 将 Tavily 可视化图表也纳入图表附录
+    if tavily_charts:
+        chart_files.extend(tavily_charts)
+
     if generate_charts and len(chart_files) > 0:
         doc.add_heading("图表附录", level=1)
         for i, (chart_name, chart_file) in enumerate(chart_files, 1):
@@ -667,22 +809,63 @@ def generate_math_modeling_paper(user_prompt, save_path="数学建模论文.docx
 
     # 保存文档
     doc.save(save_path)
-    print(f"=== 论文生成完成！保存路径：{os.path.abspath(save_path)} ===")
-    print(f"=== 共生成 {len(chart_files)} 个图表 ===")
+    update_progress(100, f"论文生成完成！保存路径：{os.path.abspath(save_path)}（共生成 {len(chart_files)} 个图表）")
+    pbar.update(1)
+    pbar.close()
+    
+    tqdm.write(f"=== 论文生成完成！保存路径：{os.path.abspath(save_path)} ===")
+    tqdm.write(f"=== 共生成 {len(chart_files)} 个图表 ===")
     return save_path
 
 
 # ===================== 5. 运行入口 =====================
 if __name__ == "__main__":
-    # 示例：用户输入的赛题长提示词（替换为你实际的赛题描述）
-    USER_PROMPT = """
-    赛题：电商平台销量预测与定价优化问题
-    背景：某电商平台拥有近万种单品的销售数据，包含销量、价格、成本、品类等信息。平台希望通过数学建模解决以下问题：
-    1. 分析销量的时间分布规律、品类间关联关系；
-    2. 建立销量与定价的关系模型，制定定价与补货优化方案；
-    3. 筛选核心单品，建立多目标优化模型最大化收益与市场需求。
-    要求：基于真实数据特征，选择适配的数学模型，完成建模与求解。
-    """
+    # 简化命令行：直接提示用户输入赛题，若留空则使用示例；输出路径固定为“数学建模论文.docx”
+    print("请输入赛题描述（直接粘贴，回车结束；留空则使用示例赛题）：")
+    user_prompt = input().strip()
 
-    # 生成论文
-    generate_math_modeling_paper(USER_PROMPT)
+    if not user_prompt:
+        user_prompt = """
+NIPT（Non-invasive Prenatal Test，即无创产前检测）是一种通过采集母体血液、检测胎儿的游离
+DNA片段、分析胎儿染色体是否存在异常的产前检测技术，目的是通过早期检测确定胎儿的健康状况。
+根据临床经验，畸型胎儿主要有唐氏综合征、爱德华氏综合征和帕陶氏综合征，这三种体征分别由胎儿
+21 号、18号和13号“染色体游离DNA片段的比例”（简称“染色体浓度”）是否异常决定。NIPT的
+准确性主要由胎儿性染色体（男胎XY，女胎XX）浓度判断。通常孕妇的孕期在10周~25周之间可以
+检测胎儿性染色体浓度，且如果男胎的Y染色体浓度达到或高于4%、女胎的X染色体浓度没有异常，
+则可认为NIPT的结果是基本准确的，否则难以保证结果准确性要求。同时，实际中应尽早发现不健康
+的胎儿，否则会带来治疗窗口期缩短的风险，早期发现（12周以内）风险较低；中期发现（13－27周）
+风险高；晚期发现（28周以后）风险极高。 
+实践表明，男胎Y染色体浓度与孕妇孕周数及其身体质量指数（BMI）紧密相关。通常根据孕妇的
+BMI 值进行分组（例如：[20,28)，[28,32)，[32,36)，[36,40)，40 以上）分别确定 NIPT 的时点（相对孕
+期的时间点）。由于每个孕妇的年龄、BMI、孕情等存在个体差异，对所有孕妇采用简单的经验分组和
+统一的检测时点进行NIPT，会对其准确性产生较大影响。因此，依据BMI对孕妇进行合理分组，确定
+各不同群组的最佳NIPT时点，可以减少某些孕妇因胎儿不健康而缩短治疗窗口期所带来的潜在风险。 
+为了研究各类孕妇群体合适的NIPT时点，并对检测的准确性进行分析，附件给出了某地区（大多
+为高BMI）孕妇的NIPT数据。在实际检测中，经常会出现测序失败（比如：检测时点过早和不确定因
+素影响等）的情况。同时为了增加检测结果的可靠性，对某些孕妇有多次采血多次检测或一次采血多次
+检测的情况。试利用附件提供的数据建立数学模型研究如下问题： 
+问题1  试分析胎儿Y染色体浓度与孕妇的孕周数和BMI等指标的相关特性，给出相应的关系模
+型，并检验其显著性。 
+问题2  临床证明，男胎孕妇的BMI是影响胎儿Y染色体浓度的最早达标时间（即浓度达到或超
+过4%的最早时间）的主要因素。试对男胎孕妇的BMI进行合理分组，给出每组的BMI区间和最佳NIPT
+时点，使得孕妇可能的潜在风险最小，并分析检测误差对结果的影响。 
+问题3  男胎Y染色体浓度达标时间受多种因素(身高、体重、年龄等)的影响，试综合考虑这些因
+素、检测误差和胎儿的Y染色体浓度达标比例（即浓度达到或超过4%的比例），根据男胎孕妇的BMI，
+给出合理分组以及每组的最佳NIPT时点，使得孕妇潜在风险最小，并分析检测误差对结果的影响。 
+问题4  由于孕妇和女胎都不携带Y染色体，重要的是如何判定女胎是否异常。试以女胎孕妇的21
+号、18号和13号染色体非整倍体（AB列）为判定结果，综合考虑X染色体及上述染色体的Z值、GC
+含量、读段数及相关比例、BMI等因素，给出女胎异常的判定方法。
+
+""".strip()
+        print("已使用示例赛题。")
+
+    conversation_context = ""
+    yn = input("是否启用多轮对话补充信息？(y/n，默认n)：").strip().lower()
+    if yn.startswith("y"):
+        conversation_context = input("请输入多轮对话补充信息（可留空）：").strip()
+
+    generate_math_modeling_paper(
+        user_prompt,
+        save_path="数学建模论文.docx",
+        conversation_context=conversation_context,
+    )
