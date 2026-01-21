@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>数学建模论文生成系统</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-main">
+                <div>
+                    <h1>数学建模论文生成系统</h1>
+                    <p>基于大语言模型的智能论文生成工具</p>
+                </div>
+                <div class="header-badge">RAG + Tavily + LLM</div>
+            </div>
+        </header>
+
+        <main class="layout">
+            <div class="left-column">
+                <section class="input-section card">
+                    <h2>输入题目</h2>
+                    <textarea id="problem-input" placeholder="请输入数学建模题目...">赛题：电商平台销量预测与定价优化问题
+背景：某电商平台拥有近万种单品的销售数据，包含销量、价格、成本、品类等信息。平台希望通过数学建模解决以下问题：
+1. 分析销量的时间分布规律、品类间关联关系；
+2. 建立销量与定价的关系模型，制定定价与补货优化方案；
+3. 筛选核心单品，建立多目标优化模型最大化收益与市场需求。
+要求：基于真实数据特征，选择适配的数学模型，完成建模与求解。</textarea>
+
+                    <div class="mode-row">
+                        <div class="mode-item">
+                            <input type="radio" id="mode-single" name="chat-mode" value="single" checked>
+                            <label for="mode-single">单轮对话</label>
+                        </div>
+                        <div class="mode-item">
+                            <input type="radio" id="mode-multi" name="chat-mode" value="multi">
+                            <label for="mode-multi">多轮对话（可填写补充信息）</label>
+                        </div>
+                    </div>
+
+                    <div id="conversation-wrapper" class="conversation-wrapper hidden">
+                        <label for="conversation-input">多轮对话补充信息（可选）</label>
+                        <textarea id="conversation-input" placeholder="在这里填写补充信息，模型会在扩写时引用这些内容"></textarea>
+                    </div>
+
+                    <button id="submit-btn">开始生成</button>
+                </section>
+
+                <section class="progress-section card">
+                    <div class="progress-header">
+                        <h2>执行进度</h2>
+                        <span class="progress-percent" id="progress-percent">0%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div id="progress-fill" style="width: 0%"></div>
+                    </div>
+                    <div id="progress-text">等待开始...</div>
+                    <div id="progress-steps" class="progress-steps">
+                        <div class="step-dot" data-step="1">生成数据/图表</div>
+                        <div class="step-dot" data-step="2">抓取权威表格</div>
+                        <div class="step-dot" data-step="3">生成章节</div>
+                        <div class="step-dot" data-step="4">写入文档</div>
+                    </div>
+                    <div id="progress-log" class="progress-log"></div>
+                </section>
+            </div>
+
+            <div class="right-column">
+                <section class="tabs-section card">
+                    <div class="tabs">
+                        <button class="tab-btn active" data-tab="results">生成结果</button>
+                        <button class="tab-btn" data-tab="charts">可视化图表</button>
+                        <button class="tab-btn" data-tab="web-data">网络数据</button>
+                    </div>
+
+                    <div class="tab-content active" id="results-content">
+                        <h3>生成的论文章节</h3>
+                        <div id="results-container">
+                            <p>等待生成结果...</p>
+                        </div>
+                    </div>
+
+                    <div class="tab-content" id="charts-content">
+                        <h3>可视化图表</h3>
+                        <div id="charts-container">
+                            <p>等待生成图表...</p>
+                        </div>
+                    </div>
+
+                    <div class="tab-content" id="web-data-content">
+                        <h3>网络数据</h3>
+                        <div id="web-data-container">
+                            <p>等待爬取数据...</p>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+
+        <footer>
+            <p>© 2026 数学建模论文生成系统</p>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
